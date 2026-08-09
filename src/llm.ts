@@ -294,22 +294,23 @@ export function resolveModels(config?: ModelResolutionConfig): Required<ModelRes
 // Backend selection (local vs ollama)
 // =============================================================================
 
-export type BackendKind = "local" | "ollama";
+export type BackendKind = "local" | "ollama" | "hybrid";
 
 export type OllamaModelConfig = {
   host?: string;
   embed?: string;
   generate?: string;
   rerank?: string;
+  apiKey?: string;
 };
 
 export const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
 
 export function resolveBackend(config?: { backend?: BackendKind }): BackendKind {
   const env = process.env.QMD_BACKEND?.trim().toLowerCase();
-  if (env === "local" || env === "ollama") return env;
+  if (env === "local" || env === "ollama" || env === "hybrid") return env;
   const cfg = config?.backend;
-  if (cfg === "local" || cfg === "ollama") return cfg;
+  if (cfg === "local" || cfg === "ollama" || cfg === "hybrid") return cfg;
   return "local";
 }
 
@@ -319,6 +320,7 @@ export function resolveOllamaConfig(config?: OllamaModelConfig): Required<Ollama
     embed: config?.embed || process.env.QMD_OLLAMA_EMBED || "nomic-embed-text",
     generate: config?.generate || process.env.QMD_OLLAMA_GENERATE || "qwen3",
     rerank: config?.rerank || process.env.QMD_OLLAMA_RERANK || "awenleven/Qwen3-Reranker-4B:Q4_K_M",
+    apiKey: config?.apiKey || process.env.QMD_OLLAMA_API_KEY || "",
   };
 }
 
@@ -1831,6 +1833,7 @@ export class OllamaLLM implements LLM {
   private readonly embedModel: string;
   private readonly generateModel: string;
   private readonly rerankModel: string;
+  private readonly apiKey: string;
 
   constructor(config: OllamaModelConfig = {}) {
     const resolved = resolveOllamaConfig(config);
@@ -1838,6 +1841,7 @@ export class OllamaLLM implements LLM {
     this.embedModel = resolved.embed;
     this.generateModel = resolved.generate;
     this.rerankModel = resolved.rerank;
+    this.apiKey = resolved.apiKey;
   }
 
   get embedModelName(): string {
@@ -1854,12 +1858,16 @@ export class OllamaLLM implements LLM {
 
   private async request(path: string, init?: RequestInit): Promise<Response> {
     const url = `${this.host}${path}`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...((init?.headers as Record<string, string>) ?? {}),
+    };
+    if (this.apiKey) {
+      headers["Authorization"] = `Bearer ${this.apiKey}`;
+    }
     return fetch(url, {
       ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...(init?.headers ?? {}),
-      },
+      headers,
     });
   }
 
@@ -2097,6 +2105,104 @@ export class OllamaLLM implements LLM {
 
   async dispose(): Promise<void> {
     // No in-process resources to release.
+  }
+}
+
+// =============================================================================
+// Hybrid Implementation
+// =============================================================================
+
+/**
+ * Combines a local `LlamaCpp` (embeddings + tokenization, runs on CPU) with an
+ * `OllamaLLM` (query expansion + reranking against a remote Ollama server).
+ * Used when `backend: "hybrid"` is configured — useful where local LLMs are
+ * disallowed (no GPU) but small embedding models still run in-process.
+ */
+export class HybridLLM implements LLM {
+  private readonly local: LlamaCpp;
+  private readonly ollama: OllamaLLM;
+
+  constructor(config: { local?: LlamaCppConfig; ollama?: OllamaModelConfig; models?: ModelResolutionConfig } = {}) {
+    this.local = new LlamaCpp({
+      embedModel: config.models?.embed,
+      generateModel: config.models?.generate,
+      rerankModel: config.models?.rerank,
+      ...config.local,
+    });
+    this.ollama = new OllamaLLM(config.ollama);
+  }
+
+  get embedModelName(): string {
+    return this.local.embedModelName;
+  }
+
+  get generateModelName(): string {
+    return this.ollama.generateModelName;
+  }
+
+  get rerankModelName(): string {
+    return this.ollama.rerankModelName;
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    return this.local.embed(text, options);
+  }
+
+  async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    return this.local.embedBatch(texts, options);
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    return this.ollama.generate(prompt, options);
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    const [local, ollama] = await Promise.all([
+      this.local.modelExists(model),
+      this.ollama.modelExists(model),
+    ]);
+    return {
+      name: model,
+      exists: local.exists || ollama.exists,
+      path: local.exists ? local.path : undefined,
+    };
+  }
+
+  async expandQuery(
+    query: string,
+    options: { context?: string; includeLexical?: boolean; intent?: string } = {},
+  ): Promise<Queryable[]> {
+    return this.ollama.expandQuery(query, options);
+  }
+
+  async rerank(query: string, documents: RerankDocument[], options: RerankOptions = {}): Promise<RerankResult> {
+    return this.ollama.rerank(query, documents, options);
+  }
+
+  async tokenize(text: string): Promise<readonly unknown[]> {
+    return this.local.tokenize(text);
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return this.local.countTokens(text);
+  }
+
+  async detokenize(tokens: readonly unknown[]): Promise<string> {
+    return this.local.detokenize(tokens as readonly LlamaToken[]);
+  }
+
+  async getDeviceInfo(options: { allowBuild?: boolean } = {}): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram?: { total: number; used: number; free: number };
+    cpuCores: number;
+  }> {
+    return this.local.getDeviceInfo(options);
+  }
+
+  async dispose(): Promise<void> {
+    await Promise.all([this.local.dispose(), this.ollama.dispose()]);
   }
 }
 
@@ -2467,11 +2573,19 @@ export type LLMFactoryConfig = {
  * Create the LLM implementation for the configured backend.
  * - "local"  -> LlamaCpp (node-llama-cpp, GGUF models in-process)
  * - "ollama" -> OllamaLLM (Ollama HTTP server)
+ * - "hybrid" -> HybridLLM (local embeddings + remote Ollama generate/rerank)
  */
 export function createLLM(config: LLMFactoryConfig = {}): LLM {
   const backend = resolveBackend({ backend: config.backend });
   if (backend === "ollama") {
     return new OllamaLLM(config.ollama);
+  }
+  if (backend === "hybrid") {
+    return new HybridLLM({
+      models: config.models,
+      local: config.llamaCpp,
+      ollama: config.ollama,
+    });
   }
   return new LlamaCpp({
     embedModel: config.models?.embed,

@@ -3584,6 +3584,10 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
     doctorCheck("model cache", true, "n/a (ollama backend; models managed by ollama pull)");
     return;
   }
+  if (backend === "hybrid") {
+    doctorCheck("model cache", true, "n/a (hybrid backend; local embedding model managed by qmd pull, generate/rerank by ollama pull)");
+    return;
+  }
   const models = [
     ["embedding", activeModels.embed],
     ["generation", activeModels.generate],
@@ -3635,7 +3639,11 @@ async function checkBackend(config: CollectionConfig | null, nextSteps: string[]
   }
 
   const ollama = resolveOllamaConfig(config?.ollama);
-  doctorCheck("backend", true, `ollama (${ollama.host})`);
+  if (backend === "hybrid") {
+    doctorCheck("backend", true, `hybrid (embed=local, generate/rerank=ollama ${ollama.host})`);
+  } else {
+    doctorCheck("backend", true, `ollama (${ollama.host})`);
+  }
 
   // Connectivity + model availability
   try {
@@ -3906,7 +3914,7 @@ async function showDoctor(): Promise<void> {
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
   await checkBackend(configCheck.config, nextSteps);
-  checkModelCache(activeModels, nextSteps, configCheck.config?.backend);
+  checkModelCache(activeModels, nextSteps, resolveBackend({ backend: configCheck.config?.backend }));
 
   await runDoctorDeviceChecks(nextSteps);
 

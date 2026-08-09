@@ -645,6 +645,47 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("sets the active embed model");
   }, 20000);
 
+  test("qmd doctor reports hybrid backend and skips local GGUF cache check", async () => {
+    const env = await createIsolatedTestEnv("doctor-hybrid-backend");
+    await writeFile(join(env.configDir, "index.yml"), "collections: {}\n");
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        QMD_BACKEND: "hybrid",
+        QMD_OLLAMA_HOST: "http://127.0.0.1:1", // unreachable; backend label must still be correct
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("backend");
+    expect(stdout).toContain("hybrid (embed=local, generate/rerank=ollama");
+    // Hybrid must not report the local GGUF cache as missing 3/3.
+    expect(stdout).toContain("model cache");
+    expect(stdout).toContain("n/a (hybrid backend");
+    expect(stdout).not.toContain("missing 3/3");
+  }, 20000);
+
+  test("qmd doctor reports ollama backend and skips local GGUF cache check", async () => {
+    const env = await createIsolatedTestEnv("doctor-ollama-backend");
+    await writeFile(join(env.configDir, "index.yml"), "collections: {}\n");
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        QMD_BACKEND: "ollama",
+        QMD_OLLAMA_HOST: "http://127.0.0.1:1", // unreachable; backend label must still be correct
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("backend");
+    expect(stdout).toContain("ollama (http://127.0.0.1:1)");
+    expect(stdout).toContain("model cache");
+    expect(stdout).toContain("n/a (ollama backend");
+    expect(stdout).not.toContain("missing 3/3");
+  }, 20000);
+
   test("qmd doctor shows CPU-forced device mode with QMD_FORCE_CPU=1", async () => {
     const env = await createIsolatedTestEnv("doctor-force-cpu");
     const { stdout, exitCode } = await runQmd(["doctor"], {

@@ -42,6 +42,7 @@ afterEach(() => {
   delete process.env.QMD_OLLAMA_EMBED;
   delete process.env.QMD_OLLAMA_GENERATE;
   delete process.env.QMD_OLLAMA_RERANK;
+  delete process.env.QMD_OLLAMA_API_KEY;
 });
 
 describe("backend selection", () => {
@@ -103,6 +104,22 @@ describe("ollama config resolution", () => {
     expect(cfg.host).toBe("http://env:11434");
     expect(cfg.embed).toBe("env-embed");
   });
+
+  test("apiKey defaults to empty", () => {
+    const cfg = resolveOllamaConfig();
+    expect(cfg.apiKey).toBe("");
+  });
+
+  test("apiKey from config", () => {
+    const cfg = resolveOllamaConfig({ apiKey: "cfg-key" });
+    expect(cfg.apiKey).toBe("cfg-key");
+  });
+
+  test("apiKey from QMD_OLLAMA_API_KEY env", () => {
+    process.env.QMD_OLLAMA_API_KEY = "env-key";
+    const cfg = resolveOllamaConfig();
+    expect(cfg.apiKey).toBe("env-key");
+  });
 });
 
 describe("OllamaLLM.embed", () => {
@@ -125,6 +142,43 @@ describe("OllamaLLM.embed", () => {
     mockFetchError(500, "Internal Server Error");
     const llm = new OllamaLLM();
     expect(await llm.embed("hello")).toBeNull();
+  });
+});
+
+describe("OllamaLLM auth", () => {
+  test("sends Authorization Bearer header when apiKey is set", async () => {
+    let sentHeaders: Record<string, string> | undefined;
+    mockFetch((url, init) => {
+      sentHeaders = (init?.headers as Record<string, string>) ?? {};
+      return { embeddings: [[0.1]] };
+    });
+    const llm = new OllamaLLM({ host: "http://localhost:11434", apiKey: "secret-key" });
+    await llm.embed("hello");
+    expect(sentHeaders["Authorization"]).toBe("Bearer secret-key");
+  });
+
+  test("sends Authorization Bearer header from QMD_OLLAMA_API_KEY env", async () => {
+    process.env.QMD_OLLAMA_API_KEY = "env-secret";
+    let sentHeaders: Record<string, string> | undefined;
+    mockFetch((url, init) => {
+      sentHeaders = (init?.headers as Record<string, string>) ?? {};
+      return { embeddings: [[0.1]] };
+    });
+    const llm = new OllamaLLM({ host: "http://localhost:11434" });
+    await llm.embed("hello");
+    expect(sentHeaders["Authorization"]).toBe("Bearer env-secret");
+  });
+
+  test("does not send Authorization header when no apiKey", async () => {
+    let sentHeaders: Record<string, string> | undefined;
+    mockFetch((url, init) => {
+      sentHeaders = (init?.headers as Record<string, string>) ?? {};
+      return { embeddings: [[0.1]] };
+    });
+    const llm = new OllamaLLM({ host: "http://localhost:11434" });
+    await llm.embed("hello");
+    expect(sentHeaders["Authorization"]).toBeUndefined();
+    expect(sentHeaders["Content-Type"]).toBe("application/json");
   });
 });
 

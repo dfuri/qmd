@@ -57,6 +57,7 @@ export interface OllamaConfig {
   embed?: string;
   generate?: string;
   rerank?: string;
+  apiKey?: string;    // Bearer API key (Authorization header)
 }
 
 /**
