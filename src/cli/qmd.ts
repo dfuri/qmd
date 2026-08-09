@@ -80,7 +80,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, createLLM, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, resolveBackend, resolveOllamaConfig, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -133,10 +133,10 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
+      setDefaultLlamaCpp(createLLM({
+        backend: config.backend,
+        models: { embed: activeModels.embed, generate: activeModels.generate, rerank: activeModels.rerank },
+        ollama: config.ollama,
       }));
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -3291,6 +3291,11 @@ function showHelp(): void {
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
+  console.log("LLM backend:");
+  console.log("  backend: local (default) | ollama  - Set in index.yml or via QMD_BACKEND");
+  console.log("  ollama.host / QMD_OLLAMA_HOST      - Ollama server URL (default http://localhost:11434)");
+  console.log("  ollama.embed/generate/rerank       - Ollama model tags (or QMD_OLLAMA_* env)");
+  console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
   console.log("  document where every line is typed with lex:, vec:, or hyde:. This grammar");
@@ -3574,7 +3579,11 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
   doctorCheck("model defaults", false, `non-default model configuration: ${notes.join("; ")}`);
 }
 
-function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[]): void {
+function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[], backend?: string): void {
+  if (backend === "ollama") {
+    doctorCheck("model cache", true, "n/a (ollama backend; models managed by ollama pull)");
+    return;
+  }
   const models = [
     ["embedding", activeModels.embed],
     ["generation", activeModels.generate],
@@ -3615,6 +3624,46 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
     nextSteps.push("Run `qmd pull --refresh` to replace invalid cached model files, or delete the listed file and rerun `qmd pull`.");
   } else {
     nextSteps.push("Run `qmd pull` to download missing embedding/generation/reranking models before `qmd embed` or `qmd query`.");
+  }
+}
+
+async function checkBackend(config: CollectionConfig | null, nextSteps: string[]): Promise<void> {
+  const backend = resolveBackend({ backend: config?.backend });
+  if (backend === "local") {
+    doctorCheck("backend", true, "local (node-llama-cpp)");
+    return;
+  }
+
+  const ollama = resolveOllamaConfig(config?.ollama);
+  doctorCheck("backend", true, `ollama (${ollama.host})`);
+
+  // Connectivity + model availability
+  try {
+    const resp = await fetch(`${ollama.host}/api/tags`);
+    if (!resp.ok) {
+      doctorCheck("ollama connectivity", false, `HTTP ${resp.status} ${resp.statusText}. Next: ensure the Ollama server is running and reachable at ${ollama.host}`);
+      nextSteps.push(`Start the Ollama server (e.g. docker run -d -p 11434:11434 ollama/ollama) and verify it responds at ${ollama.host}/api/tags.`);
+      return;
+    }
+    const data = (await resp.json()) as { models?: { name?: string }[] };
+    const available = new Set((data.models ?? []).map((m) => m.name));
+    const required = [
+      ["embedding", ollama.embed],
+      ["generation", ollama.generate],
+      ["reranking", ollama.rerank],
+    ] as const;
+    const missing = required.filter(([, name]) => !available.has(name));
+    if (missing.length === 0) {
+      doctorCheck("ollama models", true, `${required.length} configured models available`);
+    } else {
+      const missingList = missing.map(([role, name]) => `${role}: ${name}`).join("; ");
+      doctorCheck("ollama models", false, `missing ${missing.length}: ${missingList}. Next: run \`ollama pull <name>\` for each`);
+      nextSteps.push(`Pull the missing Ollama models: ${missing.map(([, name]) => `ollama pull ${name}`).join(" && ")}.`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    doctorCheck("ollama connectivity", false, `cannot reach ${ollama.host}: ${message}. Next: ensure the Ollama server is running`);
+    nextSteps.push(`Start the Ollama server and verify it responds at ${ollama.host}/api/tags.`);
   }
 }
 
@@ -3856,7 +3905,8 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
+  await checkBackend(configCheck.config, nextSteps);
+  checkModelCache(activeModels, nextSteps, configCheck.config?.backend);
 
   await runDoctorDeviceChecks(nextSteps);
 

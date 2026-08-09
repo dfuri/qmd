@@ -290,6 +290,38 @@ export function resolveModels(config?: ModelResolutionConfig): Required<ModelRes
   };
 }
 
+// =============================================================================
+// Backend selection (local vs ollama)
+// =============================================================================
+
+export type BackendKind = "local" | "ollama";
+
+export type OllamaModelConfig = {
+  host?: string;
+  embed?: string;
+  generate?: string;
+  rerank?: string;
+};
+
+export const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
+
+export function resolveBackend(config?: { backend?: BackendKind }): BackendKind {
+  const env = process.env.QMD_BACKEND?.trim().toLowerCase();
+  if (env === "local" || env === "ollama") return env;
+  const cfg = config?.backend;
+  if (cfg === "local" || cfg === "ollama") return cfg;
+  return "local";
+}
+
+export function resolveOllamaConfig(config?: OllamaModelConfig): Required<OllamaModelConfig> {
+  return {
+    host: config?.host || process.env.QMD_OLLAMA_HOST || DEFAULT_OLLAMA_HOST,
+    embed: config?.embed || process.env.QMD_OLLAMA_EMBED || "nomic-embed-text",
+    generate: config?.generate || process.env.QMD_OLLAMA_GENERATE || "qwen3",
+    rerank: config?.rerank || process.env.QMD_OLLAMA_RERANK || "awenleven/Qwen3-Reranker-4B:Q4_K_M",
+  };
+}
+
 // Local model cache directory
 const MODEL_CACHE_DIR = process.env.XDG_CACHE_HOME
   ? join(process.env.XDG_CACHE_HOME, "qmd", "models")
@@ -525,6 +557,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for multiple texts
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -538,13 +575,54 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
    * Returns list of documents with relevance scores (higher = more relevant)
    */
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
+
+  /**
+   * Tokenize text. Returns an opaque token list (length approximates token count).
+   */
+  tokenize(text: string): Promise<readonly unknown[]>;
+
+  /**
+   * Count tokens in text.
+   */
+  countTokens(text: string): Promise<number>;
+
+  /**
+   * Detokenize tokens back to text.
+   */
+  detokenize(tokens: readonly unknown[]): Promise<string>;
+
+  /**
+   * Get device/GPU info for status display.
+   */
+  getDeviceInfo(options?: { allowBuild?: boolean }): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram?: { total: number; used: number; free: number };
+    cpuCores: number;
+  }>;
+
+  /**
+   * Name of the active embedding model.
+   */
+  readonly embedModelName: string;
+
+  /**
+   * Name of the active generation model.
+   */
+  readonly generateModelName: string;
+
+  /**
+   * Name of the active rerank model.
+   */
+  readonly rerankModelName: string;
 
   /**
    * Dispose of resources
@@ -1731,6 +1809,298 @@ export class LlamaCpp implements LLM {
 }
 
 // =============================================================================
+// Ollama Implementation
+// =============================================================================
+
+/**
+ * LLM implementation backed by an Ollama HTTP server.
+ *
+ * Ollama runs as a separate process (e.g. a Docker container) exposing an HTTP
+ * endpoint. This implementation calls that endpoint instead of loading GGUF
+ * models in-process. Used when `backend: "ollama"` is configured.
+ *
+ * API mapping:
+ * - embed / embedBatch  -> POST /api/embed
+ * - expandQuery          -> POST /api/chat
+ * - rerank               -> POST /api/chat (prompt-based; Ollama has no native rerank API)
+ * - modelExists          -> GET /api/tags
+ */
+export class OllamaLLM implements LLM {
+  private readonly _ciMode = !!process.env.CI;
+  private readonly host: string;
+  private readonly embedModel: string;
+  private readonly generateModel: string;
+  private readonly rerankModel: string;
+
+  constructor(config: OllamaModelConfig = {}) {
+    const resolved = resolveOllamaConfig(config);
+    this.host = resolved.host.replace(/\/+$/, "");
+    this.embedModel = resolved.embed;
+    this.generateModel = resolved.generate;
+    this.rerankModel = resolved.rerank;
+  }
+
+  get embedModelName(): string {
+    return this.embedModel;
+  }
+
+  get generateModelName(): string {
+    return this.generateModel;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankModel;
+  }
+
+  private async request(path: string, init?: RequestInit): Promise<Response> {
+    const url = `${this.host}${path}`;
+    return fetch(url, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers ?? {}),
+      },
+    });
+  }
+
+  async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    const model = options.model ?? this.embedModel;
+    const input = formatQueryForEmbedding(text, model);
+    try {
+      const resp = await this.request("/api/embed", {
+        method: "POST",
+        body: JSON.stringify({ model, input }),
+      });
+      if (!resp.ok) {
+        console.error(`Ollama embed error: ${resp.status} ${resp.statusText}`);
+        return null;
+      }
+      const data = (await resp.json()) as { embeddings?: number[][] };
+      const embedding = data.embeddings?.[0];
+      if (!embedding) return null;
+      return { embedding: Array.from(embedding), model };
+    } catch (error) {
+      console.error("Ollama embedding error:", error);
+      return null;
+    }
+  }
+
+  async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    if (texts.length === 0) return [];
+    const model = options.model ?? this.embedModel;
+    const inputs = texts.map((t) => formatDocForEmbedding(t, options.title, model));
+    try {
+      const resp = await this.request("/api/embed", {
+        method: "POST",
+        body: JSON.stringify({ model, input: inputs }),
+      });
+      if (!resp.ok) {
+        console.error(`Ollama embedBatch error: ${resp.status} ${resp.statusText}`);
+        return texts.map(() => null);
+      }
+      const data = (await resp.json()) as { embeddings?: number[][] };
+      const embeddings = data.embeddings ?? [];
+      return texts.map((_, i) => {
+        const embedding = embeddings[i];
+        if (!embedding) return null;
+        return { embedding: Array.from(embedding), model };
+      });
+    } catch (error) {
+      console.error("Ollama batch embedding error:", error);
+      return texts.map(() => null);
+    }
+  }
+
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    const model = options.model ?? this.generateModel;
+    try {
+      const resp = await this.request("/api/generate", {
+        method: "POST",
+        body: JSON.stringify({
+          model,
+          prompt,
+          stream: false,
+          options: {
+            temperature: options.temperature ?? 0.7,
+            num_predict: options.maxTokens ?? 150,
+          },
+        }),
+      });
+      if (!resp.ok) {
+        console.error(`Ollama generate error: ${resp.status} ${resp.statusText}`);
+        return null;
+      }
+      const data = (await resp.json()) as { response?: string };
+      return { text: data.response ?? "", model, done: true };
+    } catch (error) {
+      console.error("Ollama generate error:", error);
+      return null;
+    }
+  }
+
+  async modelExists(model: string): Promise<ModelInfo> {
+    try {
+      const resp = await this.request("/api/tags");
+      if (!resp.ok) return { name: model, exists: false };
+      const data = (await resp.json()) as { models?: { name?: string }[] };
+      const exists = (data.models ?? []).some((m) => m.name === model);
+      return { name: model, exists };
+    } catch {
+      return { name: model, exists: false };
+    }
+  }
+
+  async expandQuery(
+    query: string,
+    options: { context?: string; includeLexical?: boolean; intent?: string } = {}
+  ): Promise<Queryable[]> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    const includeLexical = options.includeLexical ?? true;
+    const intent = options.intent;
+    const prompt = intent
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
+      : `/no_think Expand this search query: ${query}`;
+
+    try {
+      const resp = await this.request("/api/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          model: this.generateModel,
+          messages: [{ role: "user", content: prompt }],
+          stream: false,
+          options: { temperature: 0.7, num_predict: 600 },
+        }),
+      });
+      if (!resp.ok) {
+        console.error(`Ollama expandQuery error: ${resp.status} ${resp.statusText}`);
+        return this.expandFallback(query, includeLexical);
+      }
+      const data = (await resp.json()) as { message?: { content?: string } };
+      const result = data.message?.content ?? "";
+      const lines = result.trim().split("\n");
+      const queryLower = query.toLowerCase();
+      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+      const hasQueryTerm = (text: string): boolean => {
+        const lower = text.toLowerCase();
+        if (queryTerms.length === 0) return true;
+        return queryTerms.some((term) => lower.includes(term));
+      };
+      const queryables: Queryable[] = lines
+        .map((line) => {
+          const colonIdx = line.indexOf(":");
+          if (colonIdx === -1) return null;
+          const type = line.slice(0, colonIdx).trim();
+          if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+          const text = line.slice(colonIdx + 1).trim();
+          if (!hasQueryTerm(text)) return null;
+          return { type: type as QueryType, text };
+        })
+        .filter((q): q is Queryable => q !== null);
+      const filtered = includeLexical ? queryables : queryables.filter((q) => q.type !== "lex");
+      if (filtered.length > 0) return filtered;
+      return this.expandFallback(query, includeLexical);
+    } catch (error) {
+      console.error("Ollama structured query expansion failed:", error);
+      return this.expandFallback(query, includeLexical);
+    }
+  }
+
+  private expandFallback(query: string, includeLexical: boolean): Queryable[] {
+    const fallback: Queryable[] = [
+      { type: "hyde", text: `Information about ${query}` },
+      { type: "lex", text: query },
+      { type: "vec", text: query },
+    ];
+    return includeLexical ? fallback : fallback.filter((q) => q.type !== "lex");
+  }
+
+  async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    if (documents.length === 0) return { results: [], model: this.rerankModel };
+
+    const numbered = documents
+      .map((doc, i) => `${i + 1}. ${doc.text}`)
+      .join("\n\n");
+    const prompt =
+      `You are a reranking model. Given a query and a list of documents, ` +
+      `return the document numbers sorted by relevance to the query, most relevant first. ` +
+      `Respond with only the numbers, comma-separated.\n\n` +
+      `Query: ${query}\n\n` +
+      `Documents:\n${numbered}`;
+
+    try {
+      const resp = await this.request("/api/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          model: this.rerankModel,
+          messages: [{ role: "user", content: prompt }],
+          stream: false,
+          options: { temperature: 0, num_predict: 200 },
+        }),
+      });
+      if (!resp.ok) {
+        console.error(`Ollama rerank error: ${resp.status} ${resp.statusText}`);
+        return { results: [], model: this.rerankModel };
+      }
+      const data = (await resp.json()) as { message?: { content?: string } };
+      const content = data.message?.content ?? "";
+      const numbers = content.match(/\d+/g)?.map(Number) ?? [];
+      const seen = new Set<number>();
+      const results: RerankDocumentResult[] = [];
+      for (const n of numbers) {
+        const index = n - 1;
+        if (index < 0 || index >= documents.length || seen.has(index)) continue;
+        seen.add(index);
+        results.push({ file: documents[index]!.file, score: 1 - results.length / documents.length, index });
+      }
+      // Append any documents the model omitted, in original order.
+      for (let i = 0; i < documents.length; i++) {
+        if (!seen.has(i)) {
+          results.push({ file: documents[i]!.file, score: 0, index: i });
+        }
+      }
+      return { results, model: this.rerankModel };
+    } catch (error) {
+      console.error("Ollama rerank error:", error);
+      return { results: [], model: this.rerankModel };
+    }
+  }
+
+  async tokenize(text: string): Promise<readonly unknown[]> {
+    // Ollama has no native tokenize API; approximate by character count.
+    return Array.from({ length: Math.ceil(text.length / 4) });
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return Math.ceil(text.length / 4);
+  }
+
+  async detokenize(tokens: readonly unknown[]): Promise<string> {
+    return tokens.map(() => "").join("");
+  }
+
+  async getDeviceInfo(): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    cpuCores: number;
+  }> {
+    return { gpu: false, gpuOffloading: false, gpuDevices: [], cpuCores: 0 };
+  }
+
+  async dispose(): Promise<void> {
+    // No in-process resources to release.
+  }
+}
+
+// =============================================================================
 // Session Management Layer
 // =============================================================================
 
@@ -1739,11 +2109,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1779,7 +2149,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLlamaCpp(): LLM {
     return this.llm;
   }
 }
@@ -1948,11 +2318,11 @@ export async function withLLMSession<T>(
 }
 
 /**
- * Execute a function with a scoped LLM session using a specific LlamaCpp instance.
+ * Execute a function with a scoped LLM session using a specific LLM instance.
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -2036,36 +2406,35 @@ export function isDarwinExitGuardInstalled(): boolean {
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// Singleton for default LLM instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLlamaCpp: LLM | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
- * constructor installs the darwin exit guard, so any code path that obtains
- * the singleton is protected.
+ * Get the default LLM instance (creates one if needed). The backend is chosen
+ * from the environment (`QMD_BACKEND`) — "local" (node-llama-cpp) or "ollama".
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
+export function getDefaultLlamaCpp(): LLM {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    defaultLlamaCpp = createLLM();
   }
   return defaultLlamaCpp;
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing). Setting a
+ * Set a custom default LLM instance (useful for testing). Setting a
  * non-null instance also ensures the darwin exit guard is installed — keeps
  * the invariant intact for test doubles that didn't go through the real
  * constructor.
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: LLM | null): void {
   if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
 }
 
 /**
- * Peek at the default LlamaCpp instance without instantiating one. Used by
+ * Peek at the default LLM instance without instantiating one. Used by
  * doctor and lifecycle diagnostics.
  */
 export function hasDefaultLlamaCpp(): boolean {
@@ -2073,7 +2442,7 @@ export function hasDefaultLlamaCpp(): boolean {
 }
 
 /**
- * Dispose the default LlamaCpp instance if it exists.
+ * Dispose the default LLM instance if it exists.
  * Call this before process exit to prevent NAPI crashes.
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
@@ -2081,4 +2450,33 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+// =============================================================================
+// Backend factory
+// =============================================================================
+
+export type LLMFactoryConfig = {
+  backend?: BackendKind;
+  models?: ModelResolutionConfig;
+  ollama?: OllamaModelConfig;
+  llamaCpp?: LlamaCppConfig;
+};
+
+/**
+ * Create the LLM implementation for the configured backend.
+ * - "local"  -> LlamaCpp (node-llama-cpp, GGUF models in-process)
+ * - "ollama" -> OllamaLLM (Ollama HTTP server)
+ */
+export function createLLM(config: LLMFactoryConfig = {}): LLM {
+  const backend = resolveBackend({ backend: config.backend });
+  if (backend === "ollama") {
+    return new OllamaLLM(config.ollama);
+  }
+  return new LlamaCpp({
+    embedModel: config.models?.embed,
+    generateModel: config.models?.generate,
+    rerankModel: config.models?.rerank,
+    ...config.llamaCpp,
+  });
 }

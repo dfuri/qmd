@@ -182,3 +182,25 @@ Key points:
 - The release script renames `[Unreleased]` → `[X.Y.Z] - date` at release time
 - Credit external PRs with `#NNN (thanks @username)`
 - GitHub releases roll up the full minor series (e.g. 1.2.0 through 1.2.3)
+
+## Workflow and Knowledge base
+
+For information about the overall domain, context, general topics, the HITL/user, tasks, reports, customer information see /home/dfurin/wiki/emas-global/AGENTS.md. Always read it, before starting any new session! Read it again, when the user says "start a new session".
+
+## Agent skills
+
+### Task tracker
+
+Issues and PRDs live as local markdown under `docs/features/`. See `docs/agents/task-tracker.md`.
+
+### Triage labels
+
+Five canonical roles with default label strings. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### LLM Wiki
+
+Public-wiki: `/home/dfurin/wiki/emas-global`. See `docs/agents/llm-wiki.md`.

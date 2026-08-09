@@ -43,6 +43,23 @@ export interface ModelsConfig {
 }
 
 /**
+ * LLM backend kind. "local" uses node-llama-cpp (GGUF models in-process);
+ * "ollama" uses an Ollama HTTP server.
+ */
+export type BackendKind = "local" | "ollama";
+
+/**
+ * Ollama backend configuration. Model names are Ollama model tags
+ * (e.g. "nomic-embed-text", "qwen3", "awenleven/Qwen3-Reranker-4B:Q4_K_M").
+ */
+export interface OllamaConfig {
+  host?: string;      // Default http://localhost:11434
+  embed?: string;
+  generate?: string;
+  rerank?: string;
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
@@ -51,6 +68,8 @@ export interface CollectionConfig {
   editor_uri_template?: string;               // Alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
+  backend?: BackendKind;                      // LLM backend (default "local")
+  ollama?: OllamaConfig;                      // Ollama backend config
 }
 
 /**
