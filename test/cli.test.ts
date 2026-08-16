@@ -436,6 +436,92 @@ describe("CLI Skill Commands", () => {
     expect(second.stderr).toContain("Skill already exists");
     expect(second.stderr).toContain("--force");
   });
+
+  test("installs a named skill via --dir and keeps its full content", async () => {
+    const targetDir = join(testDir, "skill-named");
+    const { stdout, exitCode } = await runQmd(["skill", "install", "wiki-search", "--dir", targetDir]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`✓ Installed wiki-search skill to ${targetDir}`);
+    const installed = readFileSync(join(targetDir, "SKILL.md"), "utf-8");
+    expect(installed).toContain("name: wiki-search");
+    expect(installed).toContain("Stage 3");
+  });
+
+  test("installs a named skill to the opencode directory with --opencode", async () => {
+    const fakeHome = join(testDir, "skill-opencode-home");
+    await mkdir(fakeHome, { recursive: true });
+    const targetDir = join(fakeHome, ".local", "share", "opencode", "skills", "wiki-search");
+    const { stdout, exitCode } = await runQmd(["skill", "install", "wiki-search", "--opencode"], {
+      env: { HOME: fakeHome },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(`✓ Installed wiki-search skill to ${targetDir}`);
+    expect(existsSync(join(targetDir, "SKILL.md"))).toBe(true);
+  });
+
+  test("installing an unknown skill name errors", async () => {
+    const { stderr, exitCode } = await runQmd(["skill", "install", "does-not-exist", "--dir", join(testDir, "nope")]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Skill not found: does-not-exist");
+  });
+});
+
+describe("CLI Catalog Command", () => {
+  test("generates index.md and graph.json for a vault", async () => {
+    const vault = join(testDir, "catalog-vault");
+    await mkdir(join(vault, "notes"), { recursive: true });
+    await mkdir(join(vault, "06-Archiv"), { recursive: true });
+    await writeFile(join(vault, "notes", "wal.md"), `---\ntitle: WAL\ntags: [core, infra]\nconfidence: high\n---\n\n# WAL\n\n[[Report|Report]]\n`);
+    await writeFile(join(vault, "notes", "a.md"), "[[notes/wal]]\n");
+    await writeFile(join(vault, "notes", "b.md"), "[[notes/wal]]\n");
+    await writeFile(join(vault, "notes", "c.md"), "[[notes/wal]]\n");
+    await writeFile(join(vault, "06-Archiv", "old.md"), "archiv\n");
+
+    const { stdout, exitCode } = await runQmd(["catalog", vault]);
+    expect(exitCode).toBe(0);
+    expect(existsSync(join(vault, "index.md"))).toBe(true);
+    expect(existsSync(join(vault, "graph.json"))).toBe(true);
+
+    const index = readFileSync(join(vault, "index.md"), "utf-8");
+    expect(index.startsWith("<!-- wiki-indexer | generated:")).toBe(true);
+    expect(index).toContain("## notes");
+    expect(index).toContain("- **WAL** — `notes/wal.md`");
+    expect(index).toContain("Tags: core, infra");
+    expect(index).toContain("Properties: confidence: high");
+    expect(index).not.toContain("old.md");
+  });
+
+  test("catalog --dry-run prints index.md to stdout", async () => {
+    const vault = join(testDir, "catalog-dry");
+    await mkdir(vault, { recursive: true });
+    await writeFile(join(vault, "x.md"), "---\ntitle: X\n---\n\nbody\n");
+
+    const { stdout, exitCode } = await runQmd(["catalog", vault, "--dry-run"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("<!-- wiki-indexer | generated:");
+    expect(existsSync(join(vault, "index.md"))).toBe(false);
+  });
+
+  test("catalog errors without a vault path", async () => {
+    const { stderr, exitCode } = await runQmd(["catalog"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("no vault path given");
+  });
+
+  test("catalog honors --config ignored_folders", async () => {
+    const vault = join(testDir, "catalog-config");
+    await mkdir(join(vault, "skip"), { recursive: true });
+    await writeFile(join(vault, "skip", "hidden.md"), "---\ntitle: H\n---\n\nbody\n");
+    await writeFile(join(vault, "keep.md"), "---\ntitle: K\n---\n\nbody\n");
+    const configPath = join(vault, "wiki-indexer.yaml");
+    await writeFile(configPath, "ignored_folders:\n  - skip\n");
+
+    const { stdout, exitCode } = await runQmd(["catalog", vault]);
+    expect(exitCode).toBe(0);
+    const index = readFileSync(join(vault, "index.md"), "utf-8");
+    expect(index).toContain("keep.md");
+    expect(index).not.toContain("hidden.md");
+  });
 });
 
 describe("CLI Init Command", () => {

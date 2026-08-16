@@ -69,6 +69,34 @@ qmd query "error handling" --all --files --min-score 0.4
 qmd get "docs/api-reference.md" --full
 ```
 
+#### Bundled Skills
+
+QMD ships ready-made agent skills. List them and install any of them into a
+target agent's skill directory:
+
+```sh
+# List bundled skills
+qmd skills list
+
+# Install the qmd skill into ./.agents/skills/qmd (default)
+qmd skill install
+
+# Install any bundled skill to a target location
+qmd skill install wiki-search --opencode   # → ~/.local/share/opencode/skills/wiki-search
+qmd skill install wiki-search --dir /path  # → any explicit directory
+qmd skill install wiki-search              # → ./.agents/skills/wiki-search
+```
+
+The `wiki-search` skill is a multi-stage funnel for searching a Markdown wiki
+vault: it scans `index.md` (stage 1), then `09-wiki/` (stage 2), then qmd
+semantic search (stage 3), and finally picks the best match (stage 4). Stage 3
+prefers the MCP `query` tool when a qmd MCP server is available, and falls back
+to the `qmd query` CLI otherwise — so the same skill works inside a container
+(sidecar) and locally without an MCP server.
+
+Only the `qmd` skill is installed as a slim bootstrap stub (it loads the full
+instructions via `!qmd skill show`); other skills keep their full content.
+
 ### MCP Server
 
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
@@ -163,6 +191,35 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 Unknown parameters are silently ignored (not rejected) — double-check names if
 results seem unscoped. The HTTP `/query` and `/search` endpoints return
 `qmd://collection/path` URIs in the `file` field, matching the CLI and MCP output.
+
+### Cataloging a Wiki
+
+`qmd catalog` generates a Markdown index (`index.md`) and a wikilink graph
+(`graph.json`) for a wiki vault. It walks a directory of `*.md` files, reads
+YAML frontmatter, and writes a grouped catalog with titles, tags, properties,
+file sizes, and a link graph. Useful as stage 1 of a search funnel over an
+Obsidian/LLM-wiki vault.
+
+```sh
+# Write index.md + graph.json into the vault
+qmd catalog ~/wiki/emas-global
+
+# Print instead of writing
+qmd catalog ~/wiki/emas-global --dry-run
+
+# Custom ignored folders via a YAML config file
+qmd catalog <path> --config wiki-indexer.yaml
+```
+
+- Vault path: positional argument or the `WIKI_PATH` environment variable.
+- `--config`: loads `ignored_folders` from a YAML file (replaces the defaults).
+- Default ignored folders: `.git`, `.obsidian`, `06-Archiv`, `Excalidraw`,
+  `raw`, `.qmd`, `00-Kontext`, `01-Inbox`; default ignored files: `index.md`,
+  `graph.json`, `log.md`.
+
+Vault configuration stays outside of qmd — pass the path(s) yourself. An
+orchestration wrapper can loop over multiple vaults and call `qmd catalog`,
+`qmd update`, and `qmd embed` in sequence.
 
 ### SDK / Library Usage
 

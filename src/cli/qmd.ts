@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
+import YAML from "yaml";
 import { createInterface } from "readline/promises";
 import {
   getPwd,
@@ -2710,6 +2711,263 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
+// =============================================================================
+// qmd catalog — generate index.md + graph.json for a markdown vault
+// Port of EMAS wiki_indexer.py to TypeScript.
+// =============================================================================
+
+const CATALOG_IGNORED_FOLDERS = new Set([
+  ".git", ".obsidian", "06-Archiv", "Excalidraw", "raw", ".qmd",
+  "00-Kontext", "01-Inbox",
+]);
+const CATALOG_IGNORED_FILES = new Set(["index.md", "graph.json", "log.md"]);
+
+const CATALOG_WIKILINK_RE = /\[\[([^\]|]+)(?:\|([^\]|]+))?\]\]/g;
+
+function catalogCollectFiles(vaultRoot: string, ignoredFolders: Set<string>, ignoredFiles: Set<string>): string[] {
+  const vault = pathResolve(vaultRoot);
+  if (!existsSync(vault)) return [];
+  const files: string[] = [];
+  const walk = (dir: string, prefix: string) => {
+    for (const entry of readdirSync(dir)) {
+      const full = pathJoin(dir, entry);
+      if (prefix === "" && ignoredFolders.has(entry)) continue;
+      if (statSync(full).isDirectory()) {
+        walk(full, prefix === "" ? entry : `${prefix}/${entry}`);
+      } else if (entry.endsWith(".md") && !ignoredFiles.has(entry)) {
+        files.push(prefix === "" ? entry : `${prefix}/${entry}`);
+      }
+    }
+  };
+  walk(vault, "");
+  return files;
+}
+
+function catalogParseFrontmatter(filepath: string): { frontmatter: Record<string, unknown> | null; content: string } {
+  const content = readFileSync(filepath, "utf-8");
+  if (!content.startsWith("---")) return { frontmatter: null, content };
+  const parts = content.split("---", 3);
+  if (parts.length < 3) return { frontmatter: null, content };
+  try {
+    const fm = YAML.parse(parts[1]!);
+    return { frontmatter: fm && typeof fm === "object" ? fm as Record<string, unknown> : null, content };
+  } catch {
+    return { frontmatter: null, content };
+  }
+}
+
+function catalogHumanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} Bytes`;
+  else if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  else return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function catalogExtractWikilinks(content: string): { target: string; display: string }[] {
+  const links: { target: string; display: string }[] = [];
+  let m: RegExpExecArray | null;
+  CATALOG_WIKILINK_RE.lastIndex = 0;
+  while ((m = CATALOG_WIKILINK_RE.exec(content)) !== null) {
+    links.push({ target: m[1]!, display: m[2] || m[1]! });
+  }
+  return links;
+}
+
+function catalogGetTitle(filepath: string, frontmatter: Record<string, unknown> | null): string {
+  if (frontmatter && typeof frontmatter.title === "string") return frontmatter.title;
+  return basename(filepath).replace(/\.md$/, "");
+}
+
+function catalogFileDedupKey(filepath: string): string {
+  const name = basename(filepath);
+  const idx = name.lastIndexOf(".");
+  const stem = idx > 0 ? name.slice(0, idx) : name;
+  const ext = idx > 0 ? name.slice(idx) : "";
+  return stem.toLowerCase().replace(/[\s_\-]+/g, "-") + ext.toLowerCase();
+}
+
+function catalogDeduplicatePreferWiki<T extends { path: string }>(entries: T[]): T[] {
+  const seen = new Map<string, number[]>();
+  const toRemove = new Set<number>();
+  entries.forEach((entry, i) => {
+    const key = catalogFileDedupKey(entry.path);
+    const currInWiki = entry.path.includes("09-wiki/");
+    if (seen.has(key) && currInWiki) {
+      for (const prevIdx of seen.get(key)!) {
+        if (!entries[prevIdx]!.path.includes("09-wiki/")) toRemove.add(prevIdx);
+      }
+    }
+    if (!seen.has(key)) seen.set(key, []);
+    seen.get(key)!.push(i);
+  });
+  return entries.filter((_, i) => !toRemove.has(i));
+}
+
+type CatalogEntry = {
+  path: string;
+  title: string;
+  tags: string[];
+  props: string;
+  size: string;
+  wikilinks: { target: string; display: string }[];
+};
+
+function catalogEnrich(filepath: string, vault: string): CatalogEntry {
+  const full = pathJoin(vault, filepath);
+  const { frontmatter, content } = catalogParseFrontmatter(full);
+  const title = catalogGetTitle(filepath, frontmatter);
+  const tags = Array.isArray(frontmatter?.tags)
+    ? frontmatter!.tags.map(String)
+    : [];
+  const props = Object.entries(frontmatter ?? {})
+    .filter(([k]) => k !== "title" && k !== "tags")
+    .map(([k, v]) => `${k}: ${v}`)
+    .join(", ");
+  const size = catalogHumanSize(statSync(full).size);
+  const wikilinks = catalogExtractWikilinks(content);
+  return { path: filepath, title, tags, props, size, wikilinks };
+}
+
+function catalogBuildGraph(entries: CatalogEntry[]): { nodes: unknown[]; edges: unknown[] } {
+  const nodes = new Map<string, { id: string; title: string; path: string | null; exists: boolean; incoming: string[] }>();
+  const edges: { source: string; target: string; display: string }[] = [];
+  const incoming = new Map<string, string[]>();
+  for (const e of entries) {
+    nodes.set(e.path, { id: e.path, title: e.title, path: e.path, exists: true, incoming: [] });
+    for (const link of e.wikilinks) {
+      edges.push({ source: e.path, target: link.target, display: link.display });
+      if (!incoming.has(link.target)) incoming.set(link.target, []);
+      incoming.get(link.target)!.push(e.path);
+    }
+  }
+  for (const [target, sources] of incoming) {
+    if (!nodes.has(target)) {
+      const targetPath = target.endsWith(".md") ? target : `${target}.md`;
+      if (nodes.has(targetPath)) {
+        nodes.get(targetPath)!.incoming = [...new Set(sources)].sort();
+        continue;
+      }
+      nodes.set(target, { id: target, title: target, path: null, exists: false, incoming: [...new Set(sources)].sort() });
+    } else {
+      nodes.get(target)!.incoming = [...new Set(sources)].sort();
+    }
+  }
+  return {
+    nodes: [...nodes.values()].sort((a, b) => a.id.localeCompare(b.id)),
+    edges,
+  };
+}
+
+function catalogFilterIndex(entries: CatalogEntry[], incomingCounts: Map<string, number>, maxEntries = 1000): CatalogEntry[] {
+  const a: { inc: number; entry: CatalogEntry }[] = [];
+  const b: CatalogEntry[] = [];
+  for (const entry of entries) {
+    const inc = incomingCounts.get(entry.path) ?? 0;
+    const out = entry.wikilinks.length;
+    if (inc >= 3) a.push({ inc, entry });
+    else if (inc === 0 && out === 0) b.push(entry);
+  }
+  a.sort((x, y) => y.inc - x.inc);
+  const result = a.map((x) => x.entry);
+  const remaining = maxEntries - result.length;
+  if (remaining > 0) result.push(...b.slice(0, remaining));
+  else if (remaining < 0) result.length = maxEntries;
+  return result;
+}
+
+function catalogLoadConfig(configPath: string): Set<string> | null {
+  if (!existsSync(configPath)) return null;
+  try {
+    const cfg = YAML.parse(readFileSync(configPath, "utf-8"));
+    if (cfg && typeof cfg === "object" && Array.isArray((cfg as Record<string, unknown>).ignored_folders)) {
+      return new Set((cfg as { ignored_folders: string[] }).ignored_folders);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function catalogMergeConfig(config: Set<string> | null): Set<string> {
+  if (config === null) return new Set(CATALOG_IGNORED_FOLDERS);
+  return config;
+}
+
+function renderCatalogIndex(groups: Map<string, CatalogEntry[]>, vaultRoot: string): string {
+  const now = new Date().toISOString();
+  const lines = [`<!-- wiki-indexer | generated: ${now} | vault: ${vaultRoot} -->`, "", "# Index"];
+  const keys = [...groups.keys()].sort((a, b) => (a === null ? -1 : b === null ? 1 : a.localeCompare(b)));
+  for (const group of keys) {
+    const files = groups.get(group) ?? [];
+    if (files.length === 0) continue;
+    const label = group === null ? "Root" : group;
+    lines.push("", `## ${label}`);
+    for (const f of files) {
+      lines.push("", `- **${f.title}** — \`${f.path}\` — ${f.size}`);
+      if (f.tags.length > 0) lines.push(`  - Tags: ${f.tags.join(", ")}`);
+      if (f.props) lines.push(`  - Properties: ${f.props}`);
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+function catalogGroupByDirectory(entries: CatalogEntry[]): Map<string, CatalogEntry[]> {
+  const groups = new Map<string, CatalogEntry[]>();
+  for (const e of entries) {
+    const p = e.path.split("/");
+    const first = p[0];
+    const group = p.length > 1 && first ? first : null;
+    const key = group === null ? "__root__" : group;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(e);
+  }
+  return groups;
+}
+
+function runCatalog(args: string[], values: { config?: string; "dry-run"?: boolean; help?: boolean }): void {
+  const positionals = args.filter((a) => !a.startsWith("--"));
+  const vaultRoot = positionals[0] || process.env.WIKI_PATH;
+  if (!vaultRoot) {
+    console.error("Error: no vault path given. Usage: qmd catalog <vault-path> [--config <yaml>] [--dry-run] (or set WIKI_PATH)");
+    process.exit(1);
+  }
+  const vault = pathResolve(vaultRoot);
+  if (!existsSync(vault) || !statSync(vault).isDirectory()) {
+    console.error(`Error: vault path not found: ${vaultRoot}`);
+    process.exit(1);
+  }
+  let config: Set<string> | null = null;
+  if (values.config) {
+    config = catalogLoadConfig(pathResolve(values.config));
+    if (config === null) {
+      console.error(`Error: config file not found or invalid: ${values.config}`);
+      process.exit(1);
+    }
+  } else {
+    const defaultConfig = pathJoin(vault, "wiki-indexer.yaml");
+    if (existsSync(defaultConfig)) config = catalogLoadConfig(defaultConfig);
+  }
+  const ignoredFolders = catalogMergeConfig(config);
+  const files = catalogCollectFiles(vault, ignoredFolders, CATALOG_IGNORED_FILES).sort();
+  const enriched = files.map((f) => catalogEnrich(f, vault));
+  const graph = catalogBuildGraph(enriched);
+  const indexEntries = catalogDeduplicatePreferWiki(enriched);
+  const incomingCounts = new Map<string, number>();
+  for (const n of graph.nodes) {
+    incomingCounts.set((n as { id: string }).id, (n as { incoming: string[] }).incoming.length);
+  }
+  const filtered = catalogFilterIndex(indexEntries, incomingCounts);
+  const groups = catalogGroupByDirectory(filtered);
+  const content = renderCatalogIndex(groups, vaultRoot);
+
+  if (values["dry-run"]) {
+    process.stderr.write(`# Active config: ignored_folders = ${[...ignoredFolders].sort().join(", ")}\n`);
+    process.stdout.write(content);
+    return;
+  }
+  writeFileSync(pathJoin(vault, "index.md"), content, "utf-8");
+  writeFileSync(pathJoin(vault, "graph.json"), JSON.stringify(graph, null, 2) + "\n", "utf-8");
+}
+
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
   const { values, positionals } = parseArgs({
@@ -2772,6 +3030,11 @@ function parseCLI() {
       daemon: { type: "boolean" },
       port: { type: "string" },
       host: { type: "string" },
+      // Catalog options
+      config: { type: "string" },
+      "dry-run": { type: "boolean" },
+      dir: { type: "string" },
+      opencode: { type: "boolean" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2849,10 +3112,10 @@ function parseCLI() {
   };
 }
 
-function getSkillInstallDir(globalInstall: boolean): string {
+function getSkillInstallDir(globalInstall: boolean, skillName: string): string {
   return globalInstall
-    ? resolve(homedir(), ".agents", "skills", "qmd")
-    : resolve(getPwd(), ".agents", "skills", "qmd");
+    ? resolve(homedir(), ".agents", "skills", skillName)
+    : resolve(getPwd(), ".agents", "skills", skillName);
 }
 
 function getClaudeSkillLinkPath(globalInstall: boolean): string {
@@ -3059,7 +3322,7 @@ Then follow those instructions. In short: search first, fetch full sources with
 `;
 }
 
-function writeSkillInstall(targetDir: string, force: boolean): void {
+function writeSkillInstall(targetDir: string, force: boolean, skillName: string): void {
   if (pathExists(targetDir)) {
     if (!force) {
       throw new Error(`Skill already exists: ${targetDir} (use --force to replace it)`);
@@ -3067,13 +3330,16 @@ function writeSkillInstall(targetDir: string, force: boolean): void {
     removePath(targetDir);
   }
 
-  const skill = findSkill("qmd");
+  const skill = findSkill(skillName);
   if (!skill) {
-    throw new Error("QMD skill not found. Reinstall qmd or set QMD_SKILLS_DIR.");
+    throw new Error(`Skill not found: ${skillName}. Reinstall qmd or set QMD_SKILLS_DIR.`);
   }
 
   copyDirectoryContents(skill.dir, targetDir);
-  writeFileSync(resolve(targetDir, "SKILL.md"), installedSkillStubContent(), "utf-8");
+  // The bootstrap stub is qmd-specific; non-qmd skills keep their full content.
+  if (skillName === "qmd") {
+    writeFileSync(resolve(targetDir, "SKILL.md"), installedSkillStubContent(), "utf-8");
+  }
 }
 
 function outputSkillsJson(payload: unknown): void {
@@ -3240,10 +3506,29 @@ async function shouldCreateClaudeSymlink(linkPath: string, autoYes: boolean): Pr
   }
 }
 
-async function installSkill(globalInstall: boolean, force: boolean, autoYes: boolean): Promise<void> {
-  const installDir = getSkillInstallDir(globalInstall);
-  writeSkillInstall(installDir, force);
-  console.log(`✓ Installed QMD skill to ${installDir}`);
+async function installSkill(
+  globalInstall: boolean,
+  force: boolean,
+  autoYes: boolean,
+  skillName: string,
+  targetDirOverride?: string,
+  opencodeInstall = false,
+): Promise<void> {
+  let installDir: string;
+  if (targetDirOverride) {
+    installDir = targetDirOverride;
+  } else if (opencodeInstall) {
+    installDir = resolve(homedir(), ".local", "share", "opencode", "skills", skillName);
+  } else {
+    installDir = getSkillInstallDir(globalInstall, skillName);
+  }
+  writeSkillInstall(installDir, force, skillName);
+  const label = skillName === "qmd" ? "QMD skill" : `${skillName} skill`;
+  console.log(`✓ Installed ${label} to ${installDir}`);
+
+  if (targetDirOverride || opencodeInstall || skillName !== "qmd") {
+    return;
+  }
 
   const claudeLinkPath = getClaudeSkillLinkPath(globalInstall);
   if (!(await shouldCreateClaudeSymlink(claudeLinkPath, autoYes))) {
@@ -3283,6 +3568,9 @@ function showHelp(): void {
   console.log("");
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
+  console.log("  qmd catalog <vault>           - Generate index.md + graph.json for a markdown vault");
+  console.log("    --config <yaml>             - Load ignored_folders from a YAML config file");
+  console.log("    --dry-run                   - Print index.md to stdout instead of writing");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
@@ -4059,10 +4347,12 @@ if (isMain) {
     console.log("");
     console.log("Commands:");
     console.log("  show                 Print the QMD skill");
-    console.log("  install              Install QMD skill into ./.agents/skills/qmd");
+    console.log("  install [name]       Install a bundled skill (default: qmd) into ./.agents/skills/<name>");
     console.log("");
     console.log("Options:");
-    console.log("  --global             Install into ~/.agents/skills/qmd");
+    console.log("  --global             Install into ~/.agents/skills/<name>");
+    console.log("  --opencode           Install into ~/.local/share/opencode/skills/<name>");
+    console.log("  --dir <path>         Install into an explicit target directory");
     console.log("  --yes                Also create the .claude/skills/qmd symlink");
     console.log("  -f, --force          Replace existing install or symlink");
     process.exit(0);
@@ -4333,6 +4623,18 @@ if (isMain) {
       }
       break;
 
+    case "catalog":
+      try {
+        runCatalog(cli.args, {
+          config: typeof cli.values.config === "string" ? cli.values.config : undefined,
+          "dry-run": Boolean(cli.values["dry-run"]),
+          help: Boolean(cli.values.help),
+        });
+      } catch (error) {
+        exitWithError(error);
+      }
+      break;
+
     case "status":
       await showStatus();
       break;
@@ -4560,7 +4862,15 @@ if (isMain) {
 
         case "install": {
           try {
-            await installSkill(Boolean(cli.values.global), Boolean(cli.values.force), Boolean(cli.values.yes));
+            const skillName = cli.args[1] || "qmd";
+            await installSkill(
+              Boolean(cli.values.global),
+              Boolean(cli.values.force),
+              Boolean(cli.values.yes),
+              skillName,
+              typeof cli.values.dir === "string" ? cli.values.dir : undefined,
+              Boolean(cli.values.opencode),
+            );
           } catch (error) {
             exitWithError(error);
           }
@@ -4573,10 +4883,12 @@ if (isMain) {
           console.log("");
           console.log("Commands:");
           console.log("  show                 Print the QMD skill");
-          console.log("  install              Install QMD skill into ./.agents/skills/qmd");
+          console.log("  install [name]       Install a bundled skill (default: qmd) into ./.agents/skills/<name>");
           console.log("");
           console.log("Options:");
-          console.log("  --global             Install into ~/.agents/skills/qmd");
+          console.log("  --global             Install into ~/.agents/skills/<name>");
+          console.log("  --opencode           Install into ~/.local/share/opencode/skills/<name>");
+          console.log("  --dir <path>         Install into an explicit target directory");
           console.log("  --yes                Also create the .claude/skills/qmd symlink");
           console.log("  -f, --force          Replace existing install or symlink");
           process.exit(0);
