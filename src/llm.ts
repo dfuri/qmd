@@ -294,7 +294,7 @@ export function resolveModels(config?: ModelResolutionConfig): Required<ModelRes
 // Backend selection (local vs ollama)
 // =============================================================================
 
-export type BackendKind = "local" | "ollama" | "hybrid";
+export type BackendKind = "local" | "hybrid";
 
 export type OllamaModelConfig = {
   host?: string;
@@ -308,9 +308,11 @@ export const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
 
 export function resolveBackend(config?: { backend?: BackendKind }): BackendKind {
   const env = process.env.QMD_BACKEND?.trim().toLowerCase();
-  if (env === "local" || env === "ollama" || env === "hybrid") return env;
+  if (env === "local" || env === "hybrid") return env;
+  if (env === "ollama") return "hybrid";
   const cfg = config?.backend;
-  if (cfg === "local" || cfg === "ollama" || cfg === "hybrid") return cfg;
+  if (cfg === "local" || cfg === "hybrid") return cfg;
+  if (cfg === "ollama") return "hybrid";
   return "local";
 }
 
@@ -1819,7 +1821,7 @@ export class LlamaCpp implements LLM {
  *
  * Ollama runs as a separate process (e.g. a Docker container) exposing an HTTP
  * endpoint. This implementation calls that endpoint instead of loading GGUF
- * models in-process. Used when `backend: "ollama"` is configured.
+ * models in-process. Used as the generate/rerank half of the `hybrid` backend.
  *
  * API mapping:
  * - embed / embedBatch  -> POST /api/embed
@@ -2519,7 +2521,7 @@ let defaultLlamaCpp: LLM | null = null;
 
 /**
  * Get the default LLM instance (creates one if needed). The backend is chosen
- * from the environment (`QMD_BACKEND`) — "local" (node-llama-cpp) or "ollama".
+ * from the environment (`QMD_BACKEND`) — "local" (node-llama-cpp) or "hybrid".
  */
 export function getDefaultLlamaCpp(): LLM {
   if (!defaultLlamaCpp) {
@@ -2572,14 +2574,16 @@ export type LLMFactoryConfig = {
 /**
  * Create the LLM implementation for the configured backend.
  * - "local"  -> LlamaCpp (node-llama-cpp, GGUF models in-process)
- * - "ollama" -> OllamaLLM (Ollama HTTP server)
  * - "hybrid" -> HybridLLM (local embeddings + remote Ollama generate/rerank)
  */
 export function createLLM(config: LLMFactoryConfig = {}): LLM {
-  const backend = resolveBackend({ backend: config.backend });
-  if (backend === "ollama") {
-    return new OllamaLLM(config.ollama);
+  const rawBackend = config.backend ?? process.env.QMD_BACKEND?.trim().toLowerCase();
+  if (rawBackend === "ollama") {
+    process.stderr.write(
+      `QMD Warning: backend "ollama" is removed; treating it as "hybrid" (local embeddings + Ollama generate/rerank).\n`,
+    );
   }
+  const backend = resolveBackend({ backend: config.backend });
   if (backend === "hybrid") {
     return new HybridLLM({
       models: config.models,

@@ -44,9 +44,9 @@ export interface ModelsConfig {
 
 /**
  * LLM backend kind. "local" uses node-llama-cpp (GGUF models in-process);
- * "ollama" uses an Ollama HTTP server.
+ * "hybrid" uses local embeddings with Ollama for generate/rerank.
  */
-export type BackendKind = "local" | "ollama";
+export type BackendKind = "local" | "hybrid";
 
 /**
  * Ollama backend configuration. Model names are Ollama model tags

@@ -3292,7 +3292,7 @@ function showHelp(): void {
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("LLM backend:");
-  console.log("  backend: local (default) | ollama  - Set in index.yml or via QMD_BACKEND");
+  console.log("  backend: local (default) | hybrid  - Set in index.yml or via QMD_BACKEND");
   console.log("  ollama.host / QMD_OLLAMA_HOST      - Ollama server URL (default http://localhost:11434)");
   console.log("  ollama.embed/generate/rerank       - Ollama model tags (or QMD_OLLAMA_* env)");
   console.log("");
@@ -3580,10 +3580,6 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
 }
 
 function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[], backend?: string): void {
-  if (backend === "ollama") {
-    doctorCheck("model cache", true, "n/a (ollama backend; models managed by ollama pull)");
-    return;
-  }
   if (backend === "hybrid") {
     doctorCheck("model cache", true, "n/a (hybrid backend; local embedding model managed by qmd pull, generate/rerank by ollama pull)");
     return;
@@ -3639,11 +3635,7 @@ async function checkBackend(config: CollectionConfig | null, nextSteps: string[]
   }
 
   const ollama = resolveOllamaConfig(config?.ollama);
-  if (backend === "hybrid") {
-    doctorCheck("backend", true, `hybrid (embed=local, generate/rerank=ollama ${ollama.host})`);
-  } else {
-    doctorCheck("backend", true, `ollama (${ollama.host})`);
-  }
+  doctorCheck("backend", true, `hybrid (embed=local, generate/rerank=ollama ${ollama.host})`);
 
   // Connectivity + model availability
   try {

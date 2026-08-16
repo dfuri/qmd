@@ -1218,19 +1218,20 @@ Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross
 
 Used for generating query variations via `LlamaChatSession`.
 
-### Ollama Backend
+### Hybrid Backend
 
 By default QMD runs models in-process via node-llama-cpp. On machines that do
-not allow local GGUF models, you can instead point QMD at an **Ollama** server
+not allow local LLM models, you can instead point QMD at an **Ollama** server
 (a separate process, e.g. a Docker container) that exposes an HTTP endpoint.
+The `hybrid` backend keeps the small embedding model local (CPU) while running
+query expansion and reranking against Ollama.
 
 Set the backend in `index.yml`:
 
 ```yaml
-backend: ollama
+backend: hybrid
 ollama:
   host: http://localhost:11434
-  embed: nomic-embed-text
   generate: qwen3
   rerank: awenleven/Qwen3-Reranker-4B:Q4_K_M
 ```
@@ -1238,24 +1239,28 @@ ollama:
 Or via environment variables:
 
 ```sh
-export QMD_BACKEND=ollama
+export QMD_BACKEND=hybrid
 export QMD_OLLAMA_HOST=http://localhost:11434
-export QMD_OLLAMA_EMBED=nomic-embed-text
 export QMD_OLLAMA_GENERATE=qwen3
 export QMD_OLLAMA_RERANK=awenleven/Qwen3-Reranker-4B:Q4_K_M
 ```
 
-When `backend: ollama` is active:
+When `backend: hybrid` is active:
 
-- **Embeddings** use Ollama's `POST /api/embed`.
+- **Embeddings** run locally in-process (node-llama-cpp, CPU) — no GPU needed.
 - **Query expansion** uses Ollama's `POST /api/chat`.
 - **Reranking** is prompt-based via `POST /api/chat` (Ollama has no native
   rerank API), so it is slower and less precise than the local cross-encoder.
-- `qmd pull` (GGUF download) is not used; pull models with `ollama pull <name>`.
+- `qmd pull` (GGUF download) manages the local embedding model; pull the
+  generate/rerank models with `ollama pull <name>`.
 - `qmd doctor` checks Ollama connectivity and model availability.
 
 The default backend remains `local` (node-llama-cpp), so existing setups are
 unaffected.
+
+> **Note:** The former `backend: ollama` (all three functions over Ollama) has
+> been removed. A legacy `backend: ollama` value is treated as `hybrid` with a
+> warning.
 
 ## License
 

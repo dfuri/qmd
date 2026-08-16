@@ -51,18 +51,19 @@ describe("backend selection", () => {
   });
 
   test("respects config backend", () => {
-    expect(resolveBackend({ backend: "ollama" })).toBe("ollama");
+    expect(resolveBackend({ backend: "hybrid" })).toBe("hybrid");
     expect(resolveBackend({ backend: "local" })).toBe("local");
   });
 
   test("env QMD_BACKEND overrides config", () => {
-    process.env.QMD_BACKEND = "ollama";
-    expect(resolveBackend({ backend: "local" })).toBe("ollama");
+    process.env.QMD_BACKEND = "hybrid";
+    expect(resolveBackend({ backend: "local" })).toBe("hybrid");
   });
 
-  test("createLLM returns OllamaLLM for ollama backend", () => {
-    const llm = createLLM({ backend: "ollama" });
-    expect(llm).toBeInstanceOf(OllamaLLM);
+  test("legacy ollama backend maps to hybrid", () => {
+    expect(resolveBackend({ backend: "ollama" as never })).toBe("hybrid");
+    process.env.QMD_BACKEND = "ollama";
+    expect(resolveBackend()).toBe("hybrid");
   });
 
   test("createLLM returns a non-Ollama LLM for local backend", () => {

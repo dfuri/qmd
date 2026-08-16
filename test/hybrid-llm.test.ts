@@ -50,11 +50,6 @@ describe("backend selection", () => {
     const llm = createLLM({ backend: "local" });
     expect(llm).toBeInstanceOf(LlamaCpp);
   });
-
-  test("createLLM returns OllamaLLM for ollama backend", () => {
-    const llm = createLLM({ backend: "ollama" });
-    expect(llm).toBeInstanceOf(OllamaLLM);
-  });
 });
 
 describe("HybridLLM delegation", () => {

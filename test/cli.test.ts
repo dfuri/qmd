@@ -666,7 +666,7 @@ describe("CLI Status Command", () => {
     expect(stdout).not.toContain("missing 3/3");
   }, 20000);
 
-  test("qmd doctor reports ollama backend and skips local GGUF cache check", async () => {
+  test("qmd doctor maps legacy ollama backend to hybrid and skips local GGUF cache check", async () => {
     const env = await createIsolatedTestEnv("doctor-ollama-backend");
     await writeFile(join(env.configDir, "index.yml"), "collections: {}\n");
 
@@ -680,9 +680,9 @@ describe("CLI Status Command", () => {
     });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("backend");
-    expect(stdout).toContain("ollama (http://127.0.0.1:1)");
+    expect(stdout).toContain("hybrid (embed=local, generate/rerank=ollama");
     expect(stdout).toContain("model cache");
-    expect(stdout).toContain("n/a (ollama backend");
+    expect(stdout).toContain("n/a (hybrid backend");
     expect(stdout).not.toContain("missing 3/3");
   }, 20000);
 
