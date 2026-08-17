@@ -19,9 +19,9 @@ The funnel has four stages. Per stage the rule is: **exactly one match** → rea
 
 ## Stage 1: index.md
 
-Read `{wiki}/index.md` and scan the entries (titles, tags, properties) by keyword search for the query.
+Read `{wiki}/index.md` and `{wiki}/09-wiki/index.md` and scan the entries (titles, tags, properties) by keyword search for the query.
 
-Tools: `search_files` / `grep` over the `index.md` file.
+Tools: `search_files` / `grep` over the `index.md` files. Only matching lines are returned — never load the full index into context.
 
 - **Method:** Scan each of the sections (e.g. `## 02 Projekte`) for matching `**Title**` entries whose name, tags, or properties contain the search term
 - **1 match:** extract the path from the entry (in the form `— \`path/to/file.md\` —`), read the file → answer
@@ -29,6 +29,8 @@ Tools: `search_files` / `grep` over the `index.md` file.
 - **> 1 match → Stage 2** (remember the matches for Stage 4)
 
 ## Stage 2: 09-wiki/ (LLM-Wiki)
+
+**Size gate (context guard):** Before Stage 2, check the size of `{wiki}/09-wiki/index.md` with `wc -c`. If it exceeds `WIKI_INDEX_THRESHOLD_BYTES` (env var; default `250000` = 250 KB), **skip Stage 2 entirely** and go straight to Stage 3 (qmd full-text search). Reason: the `read_file` in Step 1 below would load a large index fully into context. If the env var is unset, the documented default applies, so the skill works without configuration.
 
 Follow the query procedure from SCHEMA.md (lines 278–287):
 
