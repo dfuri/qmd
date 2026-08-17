@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Bundled two new agent skills for managing an LLM Wiki vault: `setup-wiki`
+  (scaffold or restructure a vault — AGENTS.md schema, folder structure, format
+  templates, optional Karpathy-style `09-wiki/`, and optional initial
+  domain/team content) and `wiki-ingest` (manually ingest one, several, or all
+  Layer-1 sources into `09-wiki/` with change-detection via
+  `last_ingested`/`updated`). Both are listed by `qmd skills list`, installable
+  via `qmd skill install setup-wiki` / `qmd skill install wiki-ingest`, and
+  marked `disable-model-invocation` so they are available on demand without
+  being auto-triggered. The skills resolve the wiki path from context
+  (`docs/agents/llm-wiki.md`, the session, or by asking the HITL) rather than
+  environment variables, and are fully generalized (no repo-specific EMAS,
+  cron, or tooling references).
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

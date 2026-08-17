@@ -88,11 +88,29 @@ qmd skill install wiki-search              # → ./.agents/skills/wiki-search
 ```
 
 The `wiki-search` skill is a multi-stage funnel for searching a Markdown wiki
-vault: it scans `index.md` (stage 1), then `09-wiki/` (stage 2), then qmd
-semantic search (stage 3), and finally picks the best match (stage 4). Stage 3
-prefers the MCP `query` tool when a qmd MCP server is available, and falls back
-to the `qmd query` CLI otherwise — so the same skill works inside a container
-(sidecar) and locally without an MCP server.
+vault: it scans `index.md` and `09-wiki/index.md` (stage 1), then `09-wiki/`
+(stage 2), then qmd semantic search (stage 3), and finally picks the best match
+(stage 4). Stage 2 is skipped when `09-wiki/index.md` exceeds the size threshold
+set by the `WIKI_INDEX_THRESHOLD_BYTES` environment variable (default 250 KB) —
+a context guard that falls straight through to qmd full-text search on very
+large wikis. Stage 3 prefers the MCP `query` tool when a qmd MCP server is
+available, and falls back to the `qmd query` CLI otherwise — so the same skill
+works inside a container (sidecar) and locally without an MCP server.
+
+The `setup-wiki` skill scaffolds or restructures a full LLM Wiki vault: it
+creates the `AGENTS.md` schema, the `00-Kontext/` through `06-Archiv/` folder
+structure, the `TEAM-FORMAT.md`/`DOMAIN-FORMAT.md` templates, an optional
+Karpathy-style `09-wiki/` (SCHEMA.md, index, log, and entity/concept/
+comparison/query pages), and optional initial domain/team/personal content.
+The `wiki-ingest` skill is its manual counterpart for compiling knowledge: it
+ingests one, several, or all Layer-1 sources into `09-wiki/` with
+change-detection via the `last_ingested`/`updated` frontmatter markers.
+
+Both skills are marked `disable-model-invocation` so they stay available on
+demand without being auto-triggered in normal sessions, and both resolve the
+wiki path from context (`docs/agents/llm-wiki.md`, the current session, or by
+asking the human) rather than environment variables. Install either with
+`qmd skill install setup-wiki` / `qmd skill install wiki-ingest`.
 
 Only the `qmd` skill is installed as a slim bootstrap stub (it loads the full
 instructions via `!qmd skill show`); other skills keep their full content.
@@ -213,7 +231,7 @@ qmd catalog <path> --config wiki-indexer.yaml
 
 - Vault path: positional argument or the `WIKI_PATH` environment variable.
 - `--config`: loads `ignored_folders` from a YAML file (replaces the defaults).
-- Default ignored folders: `.git`, `.obsidian`, `06-Archiv`, `Excalidraw`,
+- Default ignored folders: `.git`, `.obsidian`, `Excalidraw`,
   `raw`, `.qmd`, `00-Kontext`, `01-Inbox`; default ignored files: `index.md`,
   `graph.json`, `log.md`.
 
